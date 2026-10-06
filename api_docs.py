@@ -75,7 +75,7 @@ OPENAPI = {
                                 "type": "array",
                                 "items": {
                                     "type": "string",
-                                    "enum": ["dewrap", "shadow", "blur", "upscale", "inpaint", "appearance"],
+                                    "enum": ["dewrap", "deskew", "shadow", "blur", "upscale", "inpaint", "appearance"],
                                 },
                                 "description": "Steps to run. Omit for all of them.",
                             },
@@ -131,7 +131,7 @@ OPENAPI = {
                                             "description": "or a folder on the machine running the app"},
                             "checks": {"type": "array",
                                        "items": {"type": "string",
-                                                 "enum": ["dewrap", "shadow", "blur", "upscale", "inpaint",
+                                                 "enum": ["dewrap", "deskew", "shadow", "blur", "upscale", "inpaint",
                                                           "appearance"]},
                                        "description": "Steps to run. Omit for all of them."},
                         },

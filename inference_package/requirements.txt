@@ -1,0 +1,11 @@
+# Install with (NVIDIA GPU, CUDA 12.6 build of PyTorch):
+#   python -m venv .venv
+#   .venv\Scripts\pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu126
+# No GPU? use .../whl/cpu and drop the +cu126 suffixes below (much slower).
+torch==2.14.0+cu126
+torchvision==0.29.0+cu126
+onnxruntime==1.30.0
+opencv-python==5.0.0.93
+numpy==2.5.2
+pillow==12.3.0
+einops==0.8.2

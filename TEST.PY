@@ -1,78 +1,346 @@
+import os
 import cv2
 import numpy as np
+import csv
+from pathlib import Path
 
-# -------------------------------------------------------
-# OCR QUALITY THRESHOLDS (starting values)
-# -------------------------------------------------------
+# ============================================================
+# CONFIG
+# ============================================================
 
-THRESHOLDS = {
-    "brightness_min": 90,
-    "brightness_max": 200,
-    "contrast_min": 35,
-    "noise_max": 12,
-    "sharpness_min": 80
-}
+INPUT_FOLDER = r"C:\restoration_app\TEST1"
+OUTPUT_FOLDER = r"C:\restoration_app\TEST1_OUTPUT"
 
+# Images with detected skew below this value won't be rotated
+SKEW_THRESHOLD = 1.0
 
-# -------------------------------------------------------
-# IMAGE QUALITY METRICS
-# -------------------------------------------------------
-
-def measure_brightness(gray):
-    return float(np.mean(gray))
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 
-def measure_contrast(gray):
-    return float(np.std(gray))
+# ============================================================
+# SKEW DETECTION
+# ============================================================
 
+def determine_skew(image_path):
 
-def measure_noise(gray):
-    """Estimate noise using Gaussian residual."""
-    smooth = cv2.GaussianBlur(gray, (3, 3), 0)
-    residual = gray.astype(np.float32) - smooth.astype(np.float32)
-    return float(np.std(residual))
+    img = cv2.imread(image_path)
 
+    if img is None:
+        raise ValueError(f"Could not read image: {image_path}")
 
-def measure_sharpness(gray):
-    """Tenengrad sharpness score."""
-    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    return float(np.mean(np.sqrt(gx**2 + gy**2)))
+    # Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-
-# -------------------------------------------------------
-# MAIN QUALITY CHECK
-# -------------------------------------------------------
-
-def check_preprocessing_needed(image_bgr):
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-
-    brightness = measure_brightness(gray)
-    contrast = measure_contrast(gray)
-    noise = measure_noise(gray)
-    sharpness = measure_sharpness(gray)
-
-    issues = {}
-
-    issues["brightness"] = not (
-        THRESHOLDS["brightness_min"]
-        <= brightness
-        <= THRESHOLDS["brightness_max"]
+    # Binary threshold
+    _, thresh = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
 
-    issues["contrast"] = contrast < THRESHOLDS["contrast_min"]
-    issues["noise"] = noise > THRESHOLDS["noise_max"]
-    issues["sharpness"] = sharpness < THRESHOLDS["sharpness_min"]
+    # Connect text into larger horizontal regions
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (30, 5)
+    )
 
-    preprocessing_needed = any(issues.values())
+    dilated = cv2.dilate(
+        thresh,
+        kernel,
+        iterations=1
+    )
 
-    return {
-        "preprocessing": "YES" if preprocessing_needed else "NO",
-        "metrics": {
-            "brightness": round(brightness, 2),
-            "contrast": round(contrast, 2),
-            "noise": round(noise, 2),
-            "sharpness": round(sharpness, 2)
-        },
-        "issues": issues
-    }
+    # Detect edges
+    edges = cv2.Canny(
+        dilated,
+        50,
+        150
+    )
+
+    # Detect straight lines
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=100,
+        minLineLength=100,
+        maxLineGap=10
+    )
+
+    if lines is None:
+        return 0.0
+
+    angles = []
+
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
+
+        angle = np.degrees(
+            np.arctan2(
+                y2 - y1,
+                x2 - x1
+            )
+        )
+
+        # Only consider mostly-horizontal lines
+        if -45 < angle < 45:
+            angles.append(angle)
+
+    if len(angles) == 0:
+        return 0.0
+
+    # Median is more robust against outlier lines
+    return float(np.median(angles))
+
+
+# ============================================================
+# ROTATE IMAGE
+# ============================================================
+
+def rotate_image(image, angle):
+
+    h, w = image.shape[:2]
+
+    center = (w // 2, h // 2)
+
+    M = cv2.getRotationMatrix2D(
+        center,
+        angle,
+        1.0
+    )
+
+    # Calculate new image dimensions
+    cos = abs(M[0, 0])
+    sin = abs(M[0, 1])
+
+    new_w = int(
+        (h * sin) +
+        (w * cos)
+    )
+
+    new_h = int(
+        (h * cos) +
+        (w * sin)
+    )
+
+    # Adjust rotation matrix
+    M[0, 2] += (
+        new_w / 2
+    ) - center[0]
+
+    M[1, 2] += (
+        new_h / 2
+    ) - center[1]
+
+    # Rotate
+    rotated = cv2.warpAffine(
+        image,
+        M,
+        (new_w, new_h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255)
+    )
+
+    return rotated
+
+
+# ============================================================
+# PROCESS ONE IMAGE
+# ============================================================
+
+def process_image(input_path, output_path):
+
+    image = cv2.imread(input_path)
+
+    if image is None:
+        raise ValueError(
+            f"Could not read: {input_path}"
+        )
+
+    angle = determine_skew(input_path)
+
+    print(
+        f"{os.path.basename(input_path)} "
+        f"-> detected skew: {angle:.2f} deg"
+    )
+
+    # --------------------------------------------------------
+    # No correction required
+    # --------------------------------------------------------
+
+    if abs(angle) < SKEW_THRESHOLD:
+
+        corrected = image.copy()
+
+        print(
+            f"   Skipped "
+            f"(below {SKEW_THRESHOLD} deg)"
+        )
+
+    # --------------------------------------------------------
+    # Apply correction
+    # --------------------------------------------------------
+
+    else:
+
+        corrected = rotate_image(
+            image,
+            angle
+        )
+
+        print(
+            f"   Corrected by {-angle:.2f} deg"
+        )
+
+    cv2.imwrite(
+        output_path,
+        corrected
+    )
+
+    return angle
+
+
+# ============================================================
+# FIND IMAGES
+# ============================================================
+
+extensions = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".webp"
+}
+
+image_files = [
+    p
+    for p in Path(INPUT_FOLDER).rglob("*")
+    if p.suffix.lower() in extensions
+]
+
+print("=" * 60)
+print("SKEW CORRECTION TEST")
+print("=" * 60)
+
+print(
+    f"Input folder : {INPUT_FOLDER}"
+)
+
+print(
+    f"Images found : {len(image_files)}"
+)
+
+print(
+    f"Threshold    : {SKEW_THRESHOLD}°"
+)
+
+print("=" * 60)
+
+
+# ============================================================
+# CSV
+# ============================================================
+
+csv_path = os.path.join(
+    OUTPUT_FOLDER,
+    "skew_results.csv"
+)
+
+with open(
+    csv_path,
+    "w",
+    newline="",
+    encoding="utf-8"
+) as csv_file:
+
+    writer = csv.writer(csv_file)
+
+    writer.writerow([
+        "image",
+        "detected_skew_angle",
+        "correction_applied",
+        "correction_angle",
+        "output"
+    ])
+
+    # ========================================================
+    # PROCESS FOLDER
+    # ========================================================
+
+    for index, image_path in enumerate(
+        image_files,
+        start=1
+    ):
+
+        try:
+
+            output_name = (
+                image_path.stem +
+                "_deskewed" +
+                image_path.suffix
+            )
+
+            output_path = os.path.join(
+                OUTPUT_FOLDER,
+                output_name
+            )
+
+            angle = process_image(
+                str(image_path),
+                output_path
+            )
+
+            if abs(angle) < SKEW_THRESHOLD:
+                applied = "NO"
+                correction_angle = 0
+            else:
+                applied = "YES"
+                correction_angle = -angle
+
+            writer.writerow([
+                image_path.name,
+                f"{angle:.2f}",
+                applied,
+                f"{correction_angle:.2f}",
+                output_name
+            ])
+
+            print(
+                f"[{index}/{len(image_files)}] "
+                "DONE\n"
+            )
+
+        except Exception as e:
+
+            print(
+                f"[{index}/{len(image_files)}] "
+                f"ERROR: {e}\n"
+            )
+
+            writer.writerow([
+                image_path.name,
+                "",
+                "ERROR",
+                "",
+                str(e)
+            ])
+
+
+# ============================================================
+# COMPLETE
+# ============================================================
+
+print("=" * 60)
+print("SKEW CORRECTION COMPLETE")
+print("=" * 60)
+
+print(
+    f"Corrected images: {OUTPUT_FOLDER}"
+)
+
+print(
+    f"CSV results: {csv_path}"
+)

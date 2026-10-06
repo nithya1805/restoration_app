@@ -47,6 +47,13 @@
     .btn:hover { background: var(--primary-dark); }
     .btn:disabled { background: #a5b4f3; cursor: default; }
     .row { display: flex; gap: 10px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+    .checks { margin-top: 14px; }
+    .checks > b { display: block; font-size: .82rem; color: var(--muted); font-weight: 600;
+                  letter-spacing: .02em; text-transform: uppercase; margin-bottom: 8px; }
+    .checks .opts { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+    .checks label { display: flex; align-items: center; gap: 6px; font-size: .9rem; cursor: pointer; }
+    .checks input { accent-color: var(--accent, #4f8cff); width: 15px; height: 15px; cursor: pointer; }
+    .checks .warn { color: #d08b1e; font-size: .8rem; margin-top: 8px; min-height: 1em; }
     input[type=text] { padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
                        font: inherit; flex: 1; min-width: 160px; }
     .note { color: var(--muted); font-size: .85rem; margin-top: 10px; word-break: break-all; }
@@ -86,6 +93,17 @@
     .batch-list .item:hover { border-color: var(--primary); background: var(--primary-soft); }
     .batch-list .item .who { font-weight: 600; }
     .batch-list .item .meta { color: var(--muted); font-size: .84rem; }
+    .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+    .compare figure { margin: 0; }
+    .compare img { width: 100%; border: 1px solid var(--border); border-radius: 10px; display: block;
+                   background: #fafafa; cursor: zoom-in; }
+    .compare figcaption { color: var(--muted); font-size: .82rem; margin-top: 5px; }
+    .compare .missing { padding: 26px 10px; text-align: center; color: var(--muted); font-size: .82rem;
+                        border: 1px dashed var(--border); border-radius: 10px; }
+    .zoom { position: fixed; inset: 0; background: rgba(15, 20, 35, .88); display: grid; place-items: center;
+            padding: 24px; z-index: 50; }
+    .zoom[hidden] { display: none; }
+    .zoom img { max-width: 100%; max-height: 100%; border-radius: 8px; cursor: zoom-out; }
     .thumbs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
     .thumbs img { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); }
   </style>
@@ -103,7 +121,7 @@
         </svg>
         Image Restorer
       </h1>
-      <p>Every image is checked for <b>warping</b>, <b>shadows</b>, <b>blur</b>, <b>low resolution</b> and
+      <p>Every image is checked for <b>warping</b>, <b>skew</b>, <b>shadows</b>, <b>blur</b>, <b>low resolution</b> and
         <b>tears</b> &mdash; and only what is found gets corrected.</p>
       <a class="api-link" href="/docs" target="_blank" rel="noopener">API &amp; docs &rarr;</a>
     </div>
@@ -114,17 +132,35 @@
       <!-- ─── single image ─────────────────────────────────────────────── -->
       <section class="panel">
         <h2>Single image</h2>
-        <div class="sub">Restores one image and downloads the result.</div>
+        <div class="sub">Restores one image and shows the result next to the original.</div>
         <label class="drop" id="oneDrop">
           <input type="file" id="oneFile" accept="image/*,{{ exts_list|join(',') }}">
           <strong id="oneTitle">Click to choose an image</strong>
           <span class="hint">{{ exts }}</span>
         </label>
+        <div class="checks" id="oneChecks">
+          <b>Corrections to run</b>
+          <div class="opts">
+            <label><input type="checkbox" value="dewrap" checked> Dewraping</label>
+            <label><input type="checkbox" value="deskew" checked> Deskewing</label>
+            <label><input type="checkbox" value="shadow" checked> Shadow removal</label>
+            <label><input type="checkbox" value="blur" checked> Blur removal</label>
+            <label><input type="checkbox" value="upscale" checked> Upscaling</label>
+            <label><input type="checkbox" value="appearance" checked> Enhancement</label>
+            <label><input type="checkbox" value="inpaint" checked> Inpainting</label>
+          </div>
+          <div class="warn" id="oneWarn"></div>
+        </div>
         <div class="row">
-          <button class="btn" id="oneGo" disabled>Restore &amp; download</button>
+          <button class="btn" id="oneGo" disabled>Restore</button>
+          <a class="btn" id="oneSave" hidden>Download result</a>
         </div>
         <div class="note" id="oneNote"></div>
         <div class="thumbs" id="oneThumb"></div>
+        <div class="compare" id="oneCompare" hidden>
+          <figure><img id="beforeImg" alt="before"><figcaption>Before</figcaption></figure>
+          <figure><img id="afterImg" alt="after"><figcaption id="afterCap">After</figcaption></figure>
+        </div>
       </section>
 
       <!-- ─── batch folder ─────────────────────────────────────────────── -->
@@ -136,6 +172,19 @@
           <strong id="folderTitle">Click to choose a folder</strong>
           <span class="hint">Other files (.txt, .pdf, &hellip;) are ignored</span>
         </label>
+        <div class="checks" id="batchChecks">
+          <b>Corrections to run</b>
+          <div class="opts">
+            <label><input type="checkbox" value="dewrap" checked> Dewraping</label>
+            <label><input type="checkbox" value="deskew" checked> Deskewing</label>
+            <label><input type="checkbox" value="shadow" checked> Shadow removal</label>
+            <label><input type="checkbox" value="blur" checked> Blur removal</label>
+            <label><input type="checkbox" value="upscale" checked> Upscaling</label>
+            <label><input type="checkbox" value="appearance" checked> Enhancement</label>
+            <label><input type="checkbox" value="inpaint" checked> Inpainting</label>
+          </div>
+          <div class="warn" id="batchWarn"></div>
+        </div>
         <div class="row">
           <input type="text" id="batchName" placeholder="Batch name (optional)">
           <button class="btn" id="batchGo" disabled>Create batch</button>
@@ -191,6 +240,8 @@
         $('oneGo').disabled = !oneImage;
         $('oneNote').textContent = '';
         $('oneThumb').innerHTML = '';
+        $('oneCompare').hidden = true;
+        $('oneSave').hidden = true;
         if (oneImage) {
           const img = document.createElement('img');
           img.src = URL.createObjectURL(oneImage);
@@ -199,32 +250,94 @@
         }
       });
 
+      let resultUrl = null, beforeUrl = null;
+
+      function show(imgId, url, name) {
+        // browsers cannot display TIFF or JPEG 2000: say so instead of leaving a broken image
+        const img = $(imgId);
+        const figure = img.closest('figure');
+        figure.querySelector('.missing')?.remove();
+        img.hidden = false;
+        img.onerror = () => {
+          img.hidden = true;
+          const note = document.createElement('div');
+          note.className = 'missing';
+          note.textContent = `no preview for ${name.slice(name.lastIndexOf('.'))} in the browser`;
+          figure.prepend(note);
+        };
+        img.src = url;
+      }
+
+      // a check left unticked is not detected and not corrected
+      const chosen = prefix => [...document.querySelectorAll(`#${prefix}Checks input:checked`)]
+        .map(el => el.value);
+
+      function watchChecks(prefix) {
+        const box = $(prefix + 'Checks'), warn = $(prefix + 'Warn');
+        const update = () => {
+          const off = [...box.querySelectorAll('input')].filter(el => !el.checked)
+            .map(el => el.parentElement.textContent.trim());
+          warn.textContent = !chosen(prefix).length ? 'Nothing selected: choose at least one correction.'
+            : off.length ? 'Skipped: ' + off.join(', ') : '';
+        };
+        box.addEventListener('change', update);
+        update();
+      }
+      watchChecks('one');
+      watchChecks('batch');
+
       $('oneGo').addEventListener('click', async () => {
         if (!oneImage) return;
+        if (!chosen('one').length) { $('oneWarn').textContent = 'Nothing selected: choose at least one correction.'; return; }
         $('oneGo').disabled = true;
+        $('oneSave').hidden = true;
         $('oneNote').className = 'note';
         $('oneNote').innerHTML = '<span class="spin"></span> Restoring&hellip; this can take up to a minute.';
         try {
           const fd = new FormData();
           fd.append('image', oneImage, oneImage.name);
+          fd.append('checks', chosen('one').join(','));
           const resp = await fetch('/api/v1/images', { method: 'POST', body: fd });
           if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).detail || 'HTTP ' + resp.status);
           const blob = await resp.blob();
           const name = (resp.headers.get('content-disposition') || '').match(/filename="?([^"]+)"?/)?.[1]
             || 'restored';
-          const a = document.createElement('a');
-          a.href = URL.createObjectURL(blob);
-          a.download = name;
-          a.click();
+
+          if (resultUrl) URL.revokeObjectURL(resultUrl);
+          if (beforeUrl) URL.revokeObjectURL(beforeUrl);
+          resultUrl = URL.createObjectURL(blob);
+          beforeUrl = URL.createObjectURL(oneImage);
+
+          $('oneCompare').hidden = false;
+          $('oneThumb').innerHTML = '';                       // the small thumbnail is now redundant
+          show('beforeImg', beforeUrl, oneImage.name);
+          show('afterImg', resultUrl, name);
+          $('afterCap').textContent = 'After - ' + (resp.headers.get('x-corrections') || 'no changes');
+
+          const save = $('oneSave');                          // nothing is saved until this is clicked
+          save.href = resultUrl;
+          save.download = name;
+          save.hidden = false;
           $('oneNote').innerHTML = `Done in ${esc(resp.headers.get('x-seconds'))} s &middot; `
             + `<b>${esc(resp.headers.get('x-corrections'))}</b> &middot; `
-            + `${esc(resp.headers.get('x-resolution'))} &middot; saved as ${esc(name)}`;
+            + `${esc(resp.headers.get('x-resolution'))}`;
         } catch (e) {
           $('oneNote').className = 'note err';
           $('oneNote').textContent = 'Failed: ' + e.message;
         }
         $('oneGo').disabled = false;
       });
+
+      // click either picture to see it full size
+      document.addEventListener('click', ev => {
+        if (ev.target.matches('.compare img')) {
+          $('zoom').querySelector('img').src = ev.target.src;
+          $('zoom').hidden = false;
+        } else if (ev.target.closest('#zoom')) {
+          $('zoom').hidden = true;
+        }
+      });
+      document.addEventListener('keydown', ev => { if (ev.key === 'Escape') $('zoom').hidden = true; });
 
       // ── folder → POST /api/v1/batches ─────────────────────────────────
       let folderFiles = [];
@@ -244,9 +357,11 @@
 
       $('batchGo').addEventListener('click', () => {
         if (!folderFiles.length) return;
+        if (!chosen('batch').length) { $('batchWarn').textContent = 'Nothing selected: choose at least one correction.'; return; }
         const fd = new FormData();
         folderFiles.forEach(f => fd.append('files', f, f.webkitRelativePath || f.name));
         if ($('batchName').value.trim()) fd.append('batch_name', $('batchName').value.trim());
+        fd.append('checks', chosen('batch').join(','));
 
         $('batchGo').disabled = true;
         $('batchNote').className = 'note';
@@ -371,6 +486,7 @@
       loadList();
     })();
   </script>
+  <div class="zoom" id="zoom" hidden><img alt=""></div>
 </body>
 
 </html>

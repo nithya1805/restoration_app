@@ -39,3 +39,24 @@ Desktop.ini
 
 # Logs
 *.log
+
+# All model weights, wherever they are (models/, weights/, inference_package/) — download separately
+*.pt
+*.pth
+*.pkl
+*.onnx
+*.h5
+inference_package.zip
+
+# Test images and outputs (local data, not source code)
+5426/
+TEST1/
+TEST1_OUTPUT/
+folded/
+folded_3d_test/
+images
+synthetic/
+test/
+test_out/
+output/
+output.png

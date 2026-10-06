@@ -1,60 +1,26 @@
 #!/usr/bin/env python3
 """
-shadow_webapp/app.py
+restoration.py
 ============================================================
-Simple Flask web app that checks uploaded document images and fixes them:
+The image restoration pipeline: the models, the checks and the corrections. This is app.py from the
+Image Restorer with the web layer removed, so it can be used on its own:
 
-    INPUT
-      -> dewarp DETECTION (UVDoc bending score >= CONFIG["dewarp_threshold"]?)
-           yes -> dewarpING         (DocTr: seg.pth + geotr.pth)
-      -> SKEW DETECTION   (Hough lines on the text rows, |angle| >= CONFIG["deskew_threshold"] degrees?)
-           yes -> DESKEWING         (rotation, canvas enlarged with white so nothing is cut off)
-      -> SHADOW DETECTION (ONNX classifier, models/shadow_model.onnx), on the dewarped image
-           yes -> SHADOW CORRECTION (DocRes, task "deshadowing")
-      -> BLUR DETECTION   (MobileNetV3, models/blur_model.pt), on the dewarped/deshadowed image
-           yes -> BLUR CORRECTION   (DocRes, task "deblurring")
-      -> RESOLUTION CHECK (width or height of the corrected image below CONFIG["upscale_below_px"] = 1200 px?)
-           yes -> UPSCALING 4x      (Real-ESRGAN, models/RealESRGAN_x4plus.pth), once only
-      -> ENHANCEMENT      (DocRes, task "appearance") - always, on every image
-      -> DAMAGE DETECTION (tear / missing-paper mask, tear_mask_debug.py) - the last check
-           yes -> INPAINTING        (big-LaMa, lama_inpaint.py)
-      -> FINAL OUTPUT
+    import restoration
+    result = restoration.run_workflow(image, file_bytes, restoration.ALL_CHECKS)
 
-  * Blur detection: grid of crops at training resolution, no resizing, blur
-    probabilities averaged (same method as BLUR/infer_blur.py).
-  * Shadow detection: letterbox to a white square, BGR->RGB, scale to [0,1],
-    optional CLAHE (same preprocessing as infer_shadow_onnx.py).
-  * Corrections: DocRes (models/docres.pkl), same pre/post-processing as
-    DocRes/inference.py. Only the Restormer network definition is loaded from
-    the DocRes folder (CONFIG["docres_code_dir"]).
-
-Images or a whole folder can be uploaded. Uploads are processed in the
-background (one run at a time) and the run page (/run/<run id>) shows, live,
-which step each image is at. Every run is saved in
-results/<run id>/:  output/ (the images, same names and sub-folders: corrected
-ones fixed, good ones copied unchanged), report.csv and a ZIP of both, which
-the results page offers for download. Runs older than
-CONFIG["keep_results_days"] are deleted automatically.
-
-------------------------------------------------------------
-This folder is self-contained (see README.txt), apart from the DocRes code.
-INSTALL (once):  double-click setup.bat
-RUN:             double-click start_server.bat
-then open http://127.0.0.1:5000
+Every path in CONFIG below is relative to this folder, so the package runs wherever it is copied.
+Use inference.py to restore a whole folder of images.
 ------------------------------------------------------------
 """
-
 import copy
 import csv
 import importlib.util
 import io
 import math
 import os
-import queue
 import re
 import secrets
 import shutil
-import sys
 import threading
 import time
 import zipfile
@@ -69,7 +35,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms.functional as TF
-from flask import Flask, abort, render_template, request, send_from_directory
 from PIL import Image
 from torchvision import transforms
 
@@ -103,7 +68,7 @@ CONFIG = {
 
     # Correction (DocRes)
     "docres_model_path": BASE_DIR / "models" / "docres.pkl",
-    "docres_code_dir": Path(r"C:\DocRes"),  # folder containing m odels/restormer_arch.py
+    "docres_code_dir": BASE_DIR / "docres",  # folder containing m odels/restormer_arch.py
     "deshadow_max_side": 1600,  # as in DocRes: larger images are processed at this size, then the
                                 # correction is applied to the full-resolution image
     "deblur_max_side": 1600,    # deblurring runs at full resolution in DocRes; larger images are
@@ -114,22 +79,12 @@ CONFIG = {
     "appearance_max_side": 1600,  # DocRes "appearance" (final enhancement): as for deshadowing, larger
                                   # images are processed at this size and the result applied full-size
 
-    # dewarping (DocTr) — the first step
-    # the check is UVDoc's (its score separates bent pages from flat ones cleanly);
-    # the correction is DocTr's (seg.pth finds the page, geotr.pth flattens it)
-    "uvdoc_code_dir": Path(r"C:\UVDoc"),                         # folder containing UVDoc's model.py
-    "uvdoc_model_path": Path(r"C:\UVDoc\model\best_model.pkl"),
-    "doctr_code_dir": Path(r"C:\doctr\DocTr"),   # folder with GeoTr.py, seg.py, extractor.py, ...
-    "doctr_seg_path": BASE_DIR / "models" / "seg.pth",      # U2NETP: finds the page in the photo
-    "doctr_geotr_path": BASE_DIR / "models" / "geotr.pth",  # GeoTr: predicts the unwarping grid
+    # dewarping (UVDoc) — the first step
+    "uvdoc_code_dir": BASE_DIR / "uvdoc",                         # folder containing UVDoc's model.py
+    "uvdoc_model_path": BASE_DIR / "uvdoc" / "model" / "best_model.pkl",
     "dewarp_threshold": 0.02,   # bending left in UVDoc's predicted grid after removing shift/zoom/rotation
                                 # (coordinates -1..1); score >= threshold -> WARPED -> dewarp. Samples:
                                 # curved pages 0.024-0.035, flat pages / crops / mild warps 0.005-0.017
-
-    # Deskew (Hough lines on the text rows, no model) — right after dewarping
-    "deskew_threshold": 1.0,    # |skew| >= this many degrees -> rotated straight; below it the image is left alone
-    "deskew_max_angle": 15.0,   # lines steeper than this are not text rows (diagonals, graphics) and are ignored;
-                                # at ±45 a few diagonal lines can outvote the text and "correct" a 1° tilt by 40°
 
     # Inpainting (tear mask + big-LaMa) — the last step
     "lama_model_path": BASE_DIR / "models" / "big-lama.pt",
@@ -152,7 +107,7 @@ JPEG2000_EXTS = {".j2k", ".jp2"}  # OpenCV here can read these but not write the
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-REPORT_FIELDS = ["file", "status", "resolution", "blur_prob", "shadow_prob", "dewarp_score", "skew_angle", "damaged_pct",
+REPORT_FIELDS = ["file", "status", "resolution", "blur_prob", "shadow_prob", "dewarp_score", "damaged_pct",
                  "corrections", "seconds"]
 ENCODE_PARAMS = {".jpg": [cv2.IMWRITE_JPEG_QUALITY, 95], ".jpeg": [cv2.IMWRITE_JPEG_QUALITY, 95],
                  ".webp": [cv2.IMWRITE_WEBP_QUALITY, 95]}  # other formats are saved lossless
@@ -563,7 +518,7 @@ def docres_deblur(img):
 
 
 # ---------------------------------------------------------------------------
-# dewarpING - DocTr, same processing as DocTr/inference.py (GeoTr_Seg)/model.py)
+# dewarpING — UVDoc, same processing as UVDoc/demo.py (network from UVDoc/model.py)
 # ---------------------------------------------------------------------------
 UVDOC_IMG_SIZE = (488, 712)  # (w, h) network input, as IMG_SIZE in UVDoc/utils.py
 
@@ -595,59 +550,10 @@ def uvdoc_grid(img):
     return points_2d[:1]
 
 
-DOCTR_SIZE = (288, 288)   # the size DocTr works at, as in DocTr/inference.py
-
-
-def load_doctr(code_dir, seg_path, geotr_path):
-    """DocTr's two models as one: seg.pth (U2NETP) masks the page, geotr.pth (GeoTr) predicts the
-    grid that flattens it. Built exactly as GeoTr_Seg in DocTr/inference.py."""
-    code_dir = Path(code_dir)
-    if not (code_dir / "GeoTr.py").is_file():
-        raise SystemExit(f"ERROR: DocTr code not found: {code_dir} (set CONFIG['doctr_code_dir'])")
-    sys.path.insert(0, str(code_dir))      # GeoTr.py imports extractor / position_encoding by name
-    try:
-        from GeoTr import GeoTr
-        from seg import U2NETP
-    finally:
-        sys.path.remove(str(code_dir))
-
-    t0 = time.time()
-
-    class GeoTrSeg(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.msk = U2NETP(3, 1)
-            self.GeoTr = GeoTr(num_attn_layers=6)
-
-        def forward(self, x):
-            mask = (self.msk(x)[0] > 0.5).float()          # keep the page, blank the background
-            bm = self.GeoTr(mask * x)
-            return (2 * (bm / 286.8) - 1) * 0.99           # DocTr's scaling into -1..1
-
-    model = GeoTrSeg()
-    for part, path, cut in ((model.msk, seg_path, 6), (model.GeoTr, geotr_path, 7)):
-        # the released weights are from a DataParallel run: drop the "module."/"msk." style prefix
-        state = torch.load(path, map_location="cpu", weights_only=False)
-        wanted = part.state_dict()
-        part.load_state_dict({k[cut:]: v for k, v in state.items() if k[cut:] in wanted}, strict=False)
-    model.eval().to(DEVICE)
-    print(f"DocTr models: {Path(seg_path).name} + {Path(geotr_path).name}  ({time.time() - t0:.2f}s)")
-    return model
-
-
-@torch.no_grad()
-def dewarp_grid(img):
-    """BGR image -> DocTr's predicted unwarping grid, tensor (1, 2, 288, 288) with x, y in -1..1."""
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    inp = torch.from_numpy(cv2.resize(rgb, DOCTR_SIZE).transpose(2, 0, 1)).unsqueeze(0).float()
-    with HEAVY_LOCK:
-        return run_on_device(DEWARP_MODEL, inp)
-
-
 def deformation_score(grid):
-    """How much the page is actually bent: mean distance of the predicted grid points from the best
-    affine fit (shift / zoom / rotation / shear) of a flat grid. Shifting or zooming the whole grid
-    - which the model also predicts for flat close-up crops with no page edges - is not warping and
+    """How much the page is actually bent: mean distance of UVDoc's predicted grid points from the
+    best affine fit (shift / zoom / rotation / shear) of a flat grid. Shifting or zooming the whole
+    grid - which UVDoc also predicts for flat close-up crops with no page edges - is not warping and
     scores near 0; only curl that no straight-line transform explains is left."""
     g = grid[0].permute(1, 2, 0).numpy().reshape(-1, 2).astype(np.float64)  # predicted points (x, y)
     h, w = grid.shape[2:]
@@ -658,14 +564,12 @@ def deformation_score(grid):
 
 
 @torch.no_grad()
-def dewarp_unwarp(img, grid):
-    """Flatten the full-resolution BGR image with the predicted grid, as in DocTr/inference.py:
-    each flow channel is resized to the image and smoothed before sampling."""
+def uvdoc_unwarp(img, grid):
+    """Unwarp the full-resolution BGR image with the predicted grid (bilinear_unwarping in UVDoc)."""
     h, w = img.shape[:2]
-    flow = [cv2.blur(cv2.resize(grid[0, i].numpy(), (w, h)), (3, 3)) for i in (0, 1)]
-    lbl = torch.from_numpy(np.stack(flow, axis=2)).unsqueeze(0).float()
     x = torch.from_numpy(cv2.cvtColor(img, cv2.COLOR_BGR2RGB).transpose(2, 0, 1)).float().unsqueeze(0) / 255.0
-    out = F.grid_sample(x, lbl, align_corners=True)
+    full_grid = F.interpolate(grid, size=(h, w), mode="bilinear", align_corners=True)
+    out = F.grid_sample(x, full_grid.permute(0, 2, 3, 1), align_corners=True)
     out = (out[0].permute(1, 2, 0).numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
     return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
@@ -718,70 +622,41 @@ def lama_inpaint(bgr, mask):
 
 
 # ---------------------------------------------------------------------------
-# DESKEW — Hough lines on the text rows (same method as check_deskew.py), no model
-# ---------------------------------------------------------------------------
-def skew_angle(img):
-    """BGR image -> skew in degrees (median angle of the mostly-horizontal text lines; 0.0 if none found)."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    dilated = cv2.dilate(thresh, cv2.getStructuringElement(cv2.MORPH_RECT, (30, 5)), iterations=1)  # words -> rows
-    edges = cv2.Canny(dilated, 50, 150)
-    lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi / 180, threshold=100, minLineLength=100, maxLineGap=10)
-    if lines is None:
-        return 0.0
-    limit = float(CONFIG["deskew_max_angle"])  # only mostly-horizontal lines are text rows
-    angles = [a for x1, y1, x2, y2 in lines.reshape(-1, 4)
-              if -limit < (a := np.degrees(np.arctan2(y2 - y1, x2 - x1))) < limit]
-    return float(np.median(angles)) if angles else 0.0  # median: robust against stray lines
-
-
-def deskew_rotate(img, angle):
-    """Rotate by angle degrees about the centre, enlarging the canvas so no corner is cut off (white fill)."""
-    h, w = img.shape[:2]
-    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    cos, sin = abs(m[0, 0]), abs(m[0, 1])
-    nw, nh = int(h * sin + w * cos), int(h * cos + w * sin)
-    m[0, 2] += nw / 2 - w / 2
-    m[1, 2] += nh / 2 - h / 2
-    return cv2.warpAffine(img, m, (nw, nh), flags=cv2.INTER_CUBIC,
-                          borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
-
-
-# ---------------------------------------------------------------------------
 # WORKFLOW — shared by the web app and process_folder.py
 # ---------------------------------------------------------------------------
 def run_workflow(img, data, checks, progress=None):
-    """dewarp detection -> dewarping -> skew detection -> deskewing -> shadow detection -> shadow correction
+    """dewarp detection -> dewarping -> shadow detection -> shadow correction
     -> blur detection -> blur correction -> resolution check -> upscaling (Real-ESRGAN)
     -> enhancement (DocRes "appearance", on every image)
     -> damage detection -> inpainting (big-LaMa), the last step.
     Each check runs on the image as corrected by the steps before it.
 
     img: decoded BGR image, data: the raw file bytes (the blur model uses PIL's loader).
-    checks: which of "dewrap", "deskew", "shadow", "blur", "upscale", "inpaint", "appearance" to run.
+    checks: which of "dewarp", "shadow", "blur", "upscale", "inpaint", "appearance" to run.
     progress(stage, state, text="", hit=False), if given, is called as each step starts and ends:
     stage is one of STAGES' keys, state is "running", "done", "skipped" or "error", hit=True means
     a check found a problem. Returns a dict with "size" (w, h) and "upscaled_to" (w, h or None),
-    "dewrap" / "deskew" / "shadow" / "blur" results (None if not checked), "steps" (corrections applied, in
+    "dewarp" / "shadow" / "blur" results (None if not checked), "steps" (corrections applied, in
     order), "image" (final BGR image) and, for the blur map, "blur_bgr" + "tiles".
     """
     step = progress or (lambda *args, **kwargs: None)
     ih, iw = img.shape[:2]
     w = {"size": (iw, ih), "upscaled_to": None, "still_below": False, "blur": None, "shadow": None,
-         "dewrap": None, "deskew": None, "tear": None, "steps": [],
+         "dewrap": None, "tear": None, "steps": [],
          "blur_bgr": None, "tiles": None}
 
-    # ---- 1. dewarp detection -> dewarping (DocTr) ----
+    # ---- 1. dewarp detection -> dewarping (UVDoc) ----
     if "dewrap" in checks:
         step("dewarp_detect", "running")
-        score = deformation_score(uvdoc_grid(img))     # UVDoc decides if the page is bent
+        grid = uvdoc_grid(img)
+        score = deformation_score(grid)
         d = {"score": score, "detected": score >= float(CONFIG["dewarp_threshold"])}
         w["dewrap"] = d
         step("dewarp_detect", "done", f"{'Warped' if d['detected'] else 'Flat'} (score {score:.3f})",
              hit=d["detected"])
         if d["detected"]:
             step("dewarp_fix", "running")
-            img = dewarp_unwarp(img, dewarp_grid(img))   # DocTr flattens it
+            img = uvdoc_unwarp(img, grid)
             w["steps"].append("dewarped")
             step("dewarp_fix", "done", "dewarped")
         else:
@@ -790,26 +665,7 @@ def run_workflow(img, data, checks, progress=None):
         step("dewarp_detect", "skipped", "Not selected")
         step("dewarp_fix", "skipped", "Not selected")
 
-    # ---- 1b. Skew detection (on the dewarped image) -> deskewing (rotation, no model) ----
-    if "deskew" in checks:
-        step("skew_detect", "running")
-        angle = skew_angle(img)
-        k = {"angle": angle, "detected": abs(angle) >= float(CONFIG["deskew_threshold"])}
-        w["deskew"] = k
-        step("skew_detect", "done", f"{'Skewed' if k['detected'] else 'Straight'} ({angle:+.2f}°)",
-             hit=k["detected"])
-        if k["detected"]:
-            step("skew_fix", "running")
-            img = deskew_rotate(img, angle)
-            w["steps"].append(f"Deskewed {-angle:+.1f}°")
-            step("skew_fix", "done", f"Rotated {-angle:+.2f}°")
-        else:
-            step("skew_fix", "skipped", "Not needed")
-    else:
-        step("skew_detect", "skipped", "Not selected")
-        step("skew_fix", "skipped", "Not selected")
-
-    # ---- 2. Shadow detection (on the dewarped / deskewed image) -> shadow correction ----
+    # ---- 2. Shadow detection (on the dewarped image) -> shadow correction ----
     if "shadow" in checks:
         step("shadow_detect", "running")
         prob = predict_shadow(img)
@@ -951,8 +807,7 @@ def report_row(name, error, w, seconds):
             resolution += f" (still below {CONFIG['upscale_below_px']}, upscaled once only)"
     return {"file": name, "status": status, "resolution": resolution, "blur_prob": fmt_prob(w["blur"]),
             "shadow_prob": fmt_prob(w["shadow"]),
-            "dewarp_score": f"{w['dewrap']['score']:.4f}" if w.get("dewrap") else "",
-            "skew_angle": f"{w['deskew']['angle']:.2f}" if w.get("deskew") else "",
+            "dewarp_score": f"{w['dewarp']['score']:.4f}" if w.get("dewarp") else "",
             "damaged_pct": f"{w['tear']['damaged'] * 100:.2f}" if w.get("tear") else "", "corrections": ", then ".join(w["steps"]),
             "seconds": f"{seconds:.1f}"}
 
@@ -960,8 +815,7 @@ def report_row(name, error, w, seconds):
 # ---------------------------------------------------------------------------
 # Load models once at start-up
 # ---------------------------------------------------------------------------
-for _key in ("esrgan_model_path", "shadow_model_path", "blur_model_path", "docres_model_path",
-             "doctr_seg_path", "doctr_geotr_path", "uvdoc_model_path"):
+for _key in ("esrgan_model_path", "shadow_model_path", "blur_model_path", "docres_model_path", "uvdoc_model_path"):
     if not os.path.isfile(CONFIG[_key]):
         raise SystemExit(f"ERROR: model not found: {CONFIG[_key]}")
 
@@ -970,547 +824,16 @@ BLUR_MODEL, BLUR_SIZE, BLUR_IDX = load_blur_model(CONFIG["blur_model_path"])
 BLUR_TO_TENSOR = transforms.Compose([transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
 DOCRES_MODEL = load_docres(CONFIG["docres_code_dir"], CONFIG["docres_model_path"])
 ESRGAN_MODEL, ESRGAN_SCALE = load_esrgan(CONFIG["esrgan_model_path"])
-UVDOC_MODEL = load_uvdoc(CONFIG["uvdoc_code_dir"], CONFIG["uvdoc_model_path"])   # the check
-DEWARP_MODEL = load_doctr(CONFIG["doctr_code_dir"], CONFIG["doctr_seg_path"],   # the correction
-                          CONFIG["doctr_geotr_path"])
+UVDOC_MODEL = load_uvdoc(CONFIG["uvdoc_code_dir"], CONFIG["uvdoc_model_path"])
 LAMA_MODEL = load_lama(CONFIG["lama_model_path"])
 HEAVY_LOCK = threading.Lock()
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = CONFIG["max_upload_mb"] * 1024 * 1024
-app.config["TEMPLATES_AUTO_RELOAD"] = True  # re-read templates/index.html when it changes (no restart needed)
 
-from api_docs import docs_bp  # Swagger UI at /docs, OpenAPI at /openapi.json
-app.register_blueprint(docs_bp)
-
-
-# ---------------------------------------------------------------------------
-# Web: every upload is a run (a folder in results/), processed in the background one run
-# at a time. The run page polls /status/<run id> to show each image's progress.
-# ---------------------------------------------------------------------------
+# the pipeline's steps, and the checks that can be asked for
 STAGES = [("dewarp_detect", "Dewrap detection"), ("dewarp_fix", "Dewraping"),
-          ("skew_detect", "Skew detection"), ("skew_fix", "Deskewing"),
           ("shadow_detect", "Shadow detection"), ("shadow_fix", "Shadow removal"),
           ("blur_detect", "Blur detection"), ("blur_fix", "Blur removal"),
-          ("res_check", "Resolution check"), ("upscale", f"Upscaling (ESRGAN {ESRGAN_SCALE}×)"),
+          ("res_check", "Resolution check"), ("upscale", f"Upscaling (ESRGAN {ESRGAN_SCALE}x)"),
           ("appearance", "Enhancement (DocRes)"),
           ("tear_detect", "Damage detection"), ("tear_fix", "Inpainting (LaMa)")]
-ALL_CHECKS = {"upscale", "blur", "shadow", "dewrap", "deskew", "inpaint", "appearance"}
-JOBS = {}                  # run id -> job; in memory, so live progress is lost if the server restarts
-JOBS_LOCK = threading.Lock()
-JOB_QUEUE = queue.Queue()  # run ids waiting for the worker thread
-_worker = None
-
-
-def safe_relpath(name):
-    """Uploaded file name (may contain the folder path) -> safe relative path with '/' separators."""
-    parts = [re.sub(r'[<>:"|?*\x00-\x1f]', "_", p) for p in re.split(r"[\\/]+", name)
-             if p not in ("", ".", "..")]
-    return "/".join(parts) or "image"
-
-
-def unique_path(rel, used):
-    """Add _2, _3, ... if the same name was uploaded twice."""
-    stem, ext, n = rel[:len(rel) - len(Path(rel).suffix)], Path(rel).suffix, 2
-    while rel.lower() in used:
-        rel, n = f"{stem}_{n}{ext}", n + 1
-    used.add(rel.lower())
-    return rel
-
-
-def new_run_dir():
-    """Create results/<run id>/output and delete runs older than keep_results_days."""
-    root = CONFIG["results_dir"]
-    root.mkdir(parents=True, exist_ok=True)
-    cutoff = time.time() - CONFIG["keep_results_days"] * 86400
-    for d in root.iterdir():
-        if d.is_dir() and RUN_ID_RE.match(d.name) and d.stat().st_mtime < cutoff:
-            shutil.rmtree(d, ignore_errors=True)
-    with JOBS_LOCK:  # forget runs whose folder is gone
-        for rid in [rid for rid in JOBS if not (root / rid).exists()]:
-            del JOBS[rid]
-    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
-    (root / run_id / "output").mkdir(parents=True)
-    return run_id
-
-
-def result_url(run_id, name):
-    return quote(f"/results/{run_id}/{name}")
-
-
-def new_item(name, error=None):
-    """Progress record of one image, as sent to the page by /status."""
-    stage_state = {"state": "skipped", "text": "—"} if error else {"state": "pending", "text": ""}
-    return {"name": name, "state": "error" if error else "waiting", "error": error, "outcome": "", "seconds": None,
-            "stages": {key: dict(stage_state, hit=False) for key, _ in STAGES}}
-
-
-def set_stage(item, stage, state, text="", hit=False):
-    with JOBS_LOCK:
-        item["stages"][stage].update(state=state, text=text, hit=hit)
-
-
-def process_file(res, src, checks, run_id, index, progress):
-    """Process one uploaded image: fill res for the page, write the output file. Returns the workflow result."""
-    rel = res["name"]
-    data = src.read_bytes()
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        res["error"] = "Unreadable image"
-        return None
-
-    run_dir = CONFIG["results_dir"] / run_id
-
-    def preview(kind, im):
-        """Save a downscaled JPEG for the results page, return its URL."""
-        h, w = im.shape[:2]
-        scale = CONFIG["display_max_side"] / max(h, w)
-        if scale < 1:
-            im = cv2.resize(im, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-        name = f"previews/{index}_{kind}.jpg"
-        (run_dir / "previews").mkdir(exist_ok=True)
-        _, buf = cv2.imencode(".jpg", im, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        (run_dir / name).write_bytes(buf.tobytes())
-        return result_url(run_id, name)
-
-    res["height"], res["width"] = img.shape[:2]
-    res["original"] = preview("original", img)
-
-    w = run_workflow(img, data, checks, progress)
-    res["blur"], res["shadow"], res["steps"] = w["blur"], w["shadow"], w["steps"]
-    res["upscaled_to"], res["still_below"] = w["upscaled_to"], w["still_below"]
-    res["dewrap"], res["deskew"], res["tear"] = w["dewrap"], w["deskew"], w["tear"]
-    # ---- Final output: corrected image, or the original file unchanged ----
-    dst = run_dir / "output" / rel
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if w["steps"]:
-        dst.write_bytes(encode_image(w["image"], dst.suffix))
-        res["final"] = preview("final", w["image"])
-    else:
-        dst.write_bytes(data)
-    res["download"] = result_url(run_id, f"output/{rel}")
-    return w
-
-
-def summarize(results):
-    ok = [r for r in results if "error" not in r]
-    return {
-        "total": len(results),
-        "upscaled": sum(1 for r in ok if "upscale" in r["issues"]),
-        "shadow": sum(1 for r in ok if "shadow" in r["issues"]),
-        "dewrap": sum(1 for r in ok if "dewrap" in r["issues"]),
-        "deskew": sum(1 for r in ok if "deskew" in r["issues"]),
-        "tear": sum(1 for r in ok if "tear" in r["issues"]),
-        "enhanced": sum(1 for r in ok if "Enhanced" in r["steps"]),
-        "blur": sum(1 for r in ok if "blur" in r["issues"]),
-        "corrected": sum(1 for r in ok if r["steps"]),
-        "good": sum(1 for r in ok if not r["issues"]),
-        "errors": len(results) - len(ok),
-    }
-
-
-def run_job(job):
-    """Process all images of a run (in the worker thread), updating the progress records as it goes."""
-    run_id, checks = job["id"], job["checks"]
-    run_dir = CONFIG["results_dir"] / run_id
-    with JOBS_LOCK:
-        job["state"], job["started"] = "running", time.time()
-
-    with open(run_dir / "report.csv", "w", newline="", encoding="utf-8") as fh:
-        report = csv.DictWriter(fh, fieldnames=REPORT_FIELDS)
-        report.writeheader()
-        for i, item in enumerate(job["items"]):
-            res = {"name": item["name"], "upscaled_to": None, "shadow": None, "blur": None, "dewrap": None,
-                   "deskew": None, "tear": None, "steps": []}
-            job["results"].append(res)
-            t0, w = time.time(), None
-            if item["error"]:  # e.g. unsupported file type, found at upload
-                res["error"] = item["error"]
-            else:
-                with JOBS_LOCK:
-                    item["state"] = "processing"
-                try:
-                    w = process_file(res, run_dir / "input" / item["name"], checks, run_id, i,
-                                     lambda *args, **kwargs: set_stage(item, *args, **kwargs))
-                except Exception as e:  # e.g. out of memory in DocRes: report it, keep going with the other images
-                    res["error"] = f"Processing failed: {e}"
-            with JOBS_LOCK:
-                item["seconds"] = round(time.time() - t0, 1)
-                if "error" in res:
-                    item["state"], item["error"] = "error", res["error"]
-                    for s in item["stages"].values():
-                        if s["state"] in ("pending", "running"):
-                            s.update(state="skipped", text="—")
-                else:
-                    res["issues"] = (["upscale"] if res["upscaled_to"] else []) + \
-                        [k for k in ("blur", "shadow", "dewrap", "deskew", "tear") if res[k] and res[k].get("detected")]
-                    item["state"] = "done"
-                    item["outcome"] = ", then ".join(res["steps"]) or "No problems"
-            report.writerow(report_row(res["name"], res.get("error"), w, time.time() - t0))
-            fh.flush()
-
-    # ZIP of the output folder + report. Folder uploads keep their folder name as the ZIP's top level.
-    results = job["results"]
-    tops = {r["name"].split("/")[0] for r in results}
-    folder = tops.pop() if len(tops) == 1 and all("/" in r["name"] for r in results) else None
-    zip_name = f"{folder or 'images'}_restored.zip"
-    with zipfile.ZipFile(run_dir / zip_name, "w") as zf:  # images are already compressed: store them
-        for p in sorted((run_dir / "output").rglob("*")):
-            if p.is_file():
-                zf.write(p, p.relative_to(run_dir / "output").as_posix())
-        zf.write(run_dir / "report.csv", "report.csv", compress_type=zipfile.ZIP_DEFLATED)
-    shutil.rmtree(run_dir / "input", ignore_errors=True)  # the output folder and ZIP have everything
-
-    with JOBS_LOCK:
-        job["run"] = {"id": run_id, "dir": str(run_dir), "folder": folder,
-                      "zip": result_url(run_id, zip_name), "csv": result_url(run_id, "report.csv")}
-        job["summary"] = summarize(results)
-        job["elapsed"] = time.time() - job["started"]
-        job["state"] = "done"
-
-
-def worker():
-    """Runs are processed one after another (DocRes uses all CPU cores)."""
-    while True:
-        job = JOBS.get(JOB_QUEUE.get())
-        if job is None:
-            continue
-        try:
-            run_job(job)
-        except Exception as e:
-            with JOBS_LOCK:
-                job["state"], job["error"] = "failed", f"Run failed: {e}"
-
-
-def ensure_worker():
-    global _worker
-    with JOBS_LOCK:
-        if _worker is None or not _worker.is_alive():
-            _worker = threading.Thread(target=worker, name="restoration-worker", daemon=True)
-            _worker.start()
-
-
-def job_status(job):
-    """Snapshot of a run's progress (the JSON behind the progress table)."""
-    with JOBS_LOCK:
-        items = copy.deepcopy(job["items"])
-        state, error, started = job["state"], job.get("error"), job.get("started")
-        elapsed = job.get("elapsed") or (time.time() - started if started else 0)
-    return {"id": job["id"], "state": state, "error": error, "total": len(items),
-            "done": sum(it["state"] in ("done", "error") for it in items),
-            "elapsed": round(elapsed, 1), "items": items}
-
-
-def render_page(job=None):
-    done = job is not None and job["state"] == "done"
-    return render_template("index.html", job=job, status=job_status(job) if job else None,
-                           stages=STAGES, stage_keys=[k for k, _ in STAGES],
-                           results=job["results"] if done else [], summary=job.get("summary") if done else None,
-                           run=job.get("run") if done else None, elapsed=job.get("elapsed") if done else None,
-                           checks=job["checks"] if job else ALL_CHECKS, upscale_below_px=CONFIG["upscale_below_px"],
-                           esrgan_scale=ESRGAN_SCALE, dewarp_threshold=CONFIG["dewarp_threshold"], dewrap_threshold=CONFIG["dewarp_threshold"],
-                           shadow_threshold=CONFIG["shadow_threshold"], blur_threshold=CONFIG["blur_threshold"],
-                           exts=", ".join(sorted(VALID_EXTS)), exts_list=sorted(VALID_EXTS))
-
-
-@app.route("/")
-def index():
-    return render_page()
-
-
-@app.route("/thumb", methods=["POST"])
-def thumb():
-    """Small JPEG preview of one uploaded image, for the upload thumbnails of formats browsers
-    cannot display themselves (TIFF, JPEG 2000)."""
-    f = request.files.get("image")
-    if f is None:
-        abort(400)
-    img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        abort(415)
-    h, w = img.shape[:2]
-    scale = 256 / max(h, w)
-    if scale < 1:
-        img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    return app.response_class(buf.tobytes(), mimetype="image/jpeg")
-
-
-@app.route("/api/v1/images", methods=["POST"])
-def api_process_image():
-    """Process ONE image and return the restored file itself (synchronous, so the caller can
-    download it from this same request). Same formats and checks as a batch run.
-
-    Form fields: image (the file), checks (repeatable, or one comma-separated value).
-    The result keeps the format of the uploaded file. What was done is in the response headers:
-    X-Corrections, X-Steps-Detail, X-Resolution and X-Seconds.
-    """
-    f = request.files.get("image") or request.files.get("images")
-    if f is None or not f.filename:
-        return {"error": "no image uploaded (form field 'image')"}, 400
-
-    ext = Path(f.filename).suffix.lower()
-    if ext not in VALID_EXTS:
-        return {"error": f"unsupported file type '{ext}'", "supported": sorted(VALID_EXTS)}, 415
-
-    raw = [c for value in request.form.getlist("checks") for c in value.split(",")]
-    checks = {c.strip() for c in raw if c.strip()} & ALL_CHECKS or set(ALL_CHECKS)
-
-    data = f.read()
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        return {"error": "could not read the image"}, 415
-
-    detail = []
-    t0 = time.time()
-    try:
-        w = run_workflow(img, data, checks,
-                         lambda stage, state, text="", hit=False:
-                         state != "running" and detail.append(f"{stage}={state}" + (f":{text}" if text else "")))
-        out = encode_image(w["image"], ext)
-    except Exception as e:
-        return {"error": f"processing failed: {e}"}, 500
-
-    def header(value, limit=800):
-        """HTTP headers must be plain ASCII: the step texts contain - and x."""
-        value = value.replace("—", "-").replace("–", "-").replace("×", "x")
-        value = value.encode("ascii", "replace").decode("ascii")
-        return value[:limit - 3] + "..." if len(value) > limit else value
-
-    resolution = "{}x{}".format(*w["size"]) + (" -> {}x{}".format(*w["upscaled_to"]) if w["upscaled_to"] else "")
-    resp = app.response_class(out, mimetype="application/octet-stream")
-    resp.headers["Content-Disposition"] =         f'attachment; filename="{quote(Path(f.filename).stem)}_restored{ext}"'
-    resp.headers["X-Corrections"] = header(", ".join(w["steps"]) or "none")
-    resp.headers["X-Steps-Detail"] = header(" | ".join(detail))
-    resp.headers["X-Resolution"] = header(resolution)
-    resp.headers["X-Seconds"] = f"{time.time() - t0:.1f}"
-    return resp
-
-
-def create_run(entries, checks):
-    """Save uploaded images under results/<run id>/input and queue the run.
-    entries: (name, bytes or error string) pairs. Returns (run_id, items)."""
-    run_id = new_run_dir()
-    input_dir = CONFIG["results_dir"] / run_id / "input"
-    items, used = [], set()
-    for name, data in entries:
-        rel = unique_path(safe_relpath(name), used)
-        if isinstance(data, str):                       # already rejected (bad zip, no images, ...)
-            items.append(new_item(rel, data))
-        elif Path(rel).suffix.lower() not in VALID_EXTS:
-            items.append(new_item(rel, "Unsupported file type"))
-        else:
-            (input_dir / rel).parent.mkdir(parents=True, exist_ok=True)
-            (input_dir / rel).write_bytes(data)
-            items.append(new_item(rel))
-
-    if not any(it["error"] is None for it in items):    # nothing usable: no run
-        shutil.rmtree(CONFIG["results_dir"] / run_id, ignore_errors=True)
-        return None, items
-
-    job = {"id": run_id, "checks": checks, "state": "queued", "items": items, "results": []}
-    with JOBS_LOCK:
-        JOBS[run_id] = job
-    ensure_worker()
-    JOB_QUEUE.put(run_id)
-    return run_id, items
-
-
-def zip_entries(name, data):
-    """Images inside an uploaded ZIP, as (name, bytes) pairs, keeping the folder structure."""
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            wanted = [e for e in zf.infolist()
-                      if not e.is_dir() and Path(e.filename).suffix.lower() in VALID_EXTS
-                      and not Path(e.filename).name.startswith("._") and "__MACOSX" not in e.filename]
-            return [(e.filename, zf.read(e)) for e in wanted] or [(name, "No images in the ZIP")]
-    except zipfile.BadZipFile:
-        return [(name, "Not a readable ZIP file")]
-
-
-def uploaded_entries(files):
-    """Uploaded files -> (name, bytes) pairs; a .zip is expanded into the images it holds."""
-    entries = []
-    for f in files:
-        data = f.read()
-        if Path(f.filename).suffix.lower() == ".zip":
-            entries += zip_entries(f.filename, data)
-        else:
-            entries.append((f.filename, data))
-    return entries
-
-
-@app.route("/start", methods=["POST"])
-def start():
-    """Upload from the web page (images, a folder's files, or a .zip); opens /run/<run id>."""
-    checks = set(request.form.getlist("checks")) & ALL_CHECKS or set(ALL_CHECKS)
-    files = [f for f in request.files.getlist("images") if f.filename]
-    if not files:
-        return {"error": "No images were uploaded."}, 400
-
-    run_id, items = create_run(uploaded_entries(files), checks)
-    if run_id is None:
-        return {"error": "No usable images were uploaded.",
-                "details": [{"file": it["name"], "error": it["error"]} for it in items]}, 400
-    return {"run_id": run_id, "url": f"/run/{run_id}"}
-
-
-@app.route("/api/v1/batches", methods=["POST"])
-def api_create_batch():
-    """Process a FOLDER of images. Give it either way:
-      folder      the files of an unzipped folder, or a .zip of the folder (sub-folders kept), or
-      folder_path a folder on the machine running the app, e.g. C:\\scans\\batch1
-    Every image in it is processed one by one in the background."""
-    raw = [c for value in request.form.getlist("checks") for c in value.split(",")]
-    checks = {c.strip() for c in raw if c.strip()} & ALL_CHECKS or set(ALL_CHECKS)
-
-    files = [x for x in request.files.getlist("folder") + request.files.getlist("images") + request.files.getlist("files") if x.filename]
-    folder_path = (request.form.get("folder_path") or "").strip().strip('"')
-
-    if files:
-        entries = uploaded_entries(files)
-        first_name = files[0].filename or "upload"
-        source = first_name.split("/")[0].split("\\")[0] if "/" in first_name or "\\" in first_name else (first_name if len(files) == 1 else f"{len(files)} files uploaded")
-    elif folder_path:
-        src = Path(folder_path)
-        if not src.is_dir():
-            return {"error": f"folder not found on the server: {folder_path}"}, 404
-        found = sorted(x for x in src.rglob("*") if x.is_file() and x.suffix.lower() in VALID_EXTS)
-        if not found:
-            return {"error": f"no images ({', '.join(sorted(VALID_EXTS))}) in {folder_path}"}, 400
-        entries = [(f"{src.name}/{x.relative_to(src).as_posix()}", x.read_bytes()) for x in found]
-        source = str(src)
-    else:
-        return {"error": "no folder given: upload a folder or .zip as 'folder', or send 'folder_path' "
-                         "(a folder on the machine running the app)"}, 400
-
-    run_id, items = create_run(entries, checks)
-    if run_id is None:
-        return {"error": "no usable images in the folder",
-                "details": [{"file": it["name"], "error": it["error"]} for it in items]}, 400
-    return {"batch_id": run_id, "source": source, "total": len(items), "checks": sorted(checks),
-            "status_url": f"/api/v1/batches/{run_id}",
-            "download_url": f"/api/v1/batches/{run_id}/download",
-            "report_url": f"/api/v1/batches/{run_id}/report"}
-
-
-@app.route("/api/v1/batches/<run_id>")
-def api_batch_status(run_id):
-    """How far the batch has got: processed, remaining, failed, and what happened per image."""
-    job = JOBS.get(run_id)
-    if job is None:
-        return {"error": "unknown batch id (the app may have been restarted)"}, 404
-    s = job_status(job)
-    done = s["done"]
-    failed = sum(1 for it in s["items"] if it["state"] == "error")
-    summary = {"batch_id": run_id, "state": s["state"], "total": s["total"], "processed": done,
-               "remaining": s["total"] - done, "failed": failed, "corrected": sum(
-                   1 for it in s["items"] if it["state"] == "done" and it["outcome"] not in ("", "No problems")),
-               "elapsed_seconds": s["elapsed"], "error": s["error"],
-               "download_url": f"/api/v1/batches/{run_id}/download",
-               "current": next((it["name"] for it in s["items"] if it["state"] == "processing"), None)}
-    if request.args.get("detail") == "full":
-        summary["items"] = s["items"]
-    else:
-        summary["images"] = [{"name": it["name"], "state": it["state"], "result": it["outcome"] or it["error"],
-                              "seconds": it["seconds"]} for it in s["items"]]
-    return summary
-
-
-@app.route("/api/v1/batches/<run_id>/download")
-def api_batch_download(run_id):
-    """The processed images as a ZIP (with report.csv inside). Only once the batch is done."""
-    job = JOBS.get(run_id)
-    run_dir = CONFIG["results_dir"] / run_id
-    if job is None and not run_dir.is_dir():
-        return {"error": "unknown batch id"}, 404
-    if job is not None and job["state"] != "done":
-        return {"error": f"batch is {job['state']}, not finished yet",
-                "status_url": f"/api/v1/batches/{run_id}"}, 409
-    zips = sorted(run_dir.glob("*_restored.zip"))
-    if not zips:
-        return {"error": "no result file for this batch"}, 404
-    return send_from_directory(run_dir, zips[0].name, as_attachment=True)
-
-
-@app.route("/api/v1/batches/<run_id>/report")
-def api_batch_report(run_id):
-    """report.csv: one row per image with the scores and corrections."""
-    run_dir = CONFIG["results_dir"] / run_id
-    if not (run_dir / "report.csv").is_file():
-        return {"error": "unknown batch id, or the report is not written yet"}, 404
-    return send_from_directory(run_dir, "report.csv", as_attachment=True)
-
-
-@app.route("/run/<run_id>")
-def run_page(run_id):
-    job = JOBS.get(run_id)
-    if job is None:
-        return (f"Run {run_id} is not known (the server may have been restarted). "
-                f"Its files, if any, are in {CONFIG['results_dir'] / run_id}"), 404
-    return render_page(job)
-
-
-@app.route("/status/<run_id>")
-def status(run_id):
-    job = JOBS.get(run_id)
-    if job is None:
-        return {"error": "unknown run"}, 404
-    return job_status(job)
-
-
-@app.route("/results/<run_id>/<path:name>")
-def result_file(run_id, name):
-    if not RUN_ID_RE.match(run_id):
-        abort(404)
-    # Previews are shown in the page; everything else (output images, report, ZIP) is downloaded
-    return send_from_directory(CONFIG["results_dir"] / run_id, name,
-                               as_attachment=not name.startswith("previews/"))
-
-
-@app.errorhandler(413)
-def too_large(_):
-    return f"Upload too large (limit {CONFIG['max_upload_mb']} MB per request).", 413
-
-
-def lan_ip():
-    """Best guess at this PC's address on the local network."""
-    import socket
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))  # no packet is sent; just picks the outgoing interface
-            return s.getsockname()[0]
-    except OSError:
-        return socket.gethostbyname(socket.gethostname())
-
-
-app.config["TEMPLATES_AUTO_RELOAD"] = True  # re-read templates/index.html when it changes (no restart needed)
-
-
-if __name__ == "__main__":
-    host, port = CONFIG["host"], CONFIG["port"]
-    # The page calls the FastAPI routes in api.py (/api/v1/batches, ...), so serve through it.
-    # api.py does "import app"; point that at this already-loaded module so the models load once.
-    sys.modules["app"] = sys.modules["__main__"]
-    try:
-        import uvicorn
-        import api
-    except ImportError as e:
-        api = None
-        print(f"\nFastAPI not available ({e}); serving the Flask app only - the batch panel needs api.py.")
-    print(f"\nOpen on this PC:       http://127.0.0.1:{port}")
-    if host == "0.0.0.0":
-        print(f"Open from the network: http://{lan_ip()}:{port}")
-    if api is not None:
-        print(f"API docs:              http://127.0.0.1:{port}/docs")
-    print(f"Results are saved in:  {CONFIG['results_dir']}")
-    print("Press Ctrl+C to stop.\n")
-    if api is not None:
-        uvicorn.run(api.api, host=host, port=port)
-    else:
-        try:
-            from waitress import serve
-        except ImportError:  # fall back to Flask's development server
-            app.run(host=host, port=port, debug=False, threaded=True)
-        else:
-            serve(app, host=host, port=port, threads=8, max_request_body_size=app.config["MAX_CONTENT_LENGTH"])
+ALL_CHECKS = {"upscale", "blur", "shadow", "dewrap", "inpaint", "appearance"}

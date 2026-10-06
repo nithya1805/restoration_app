@@ -40,6 +40,8 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
+import torch
+
 import app as core  # the pipeline, the models and the run queue (loads the models)
 import batch_db    # batch / image records (SQLite, next to the results)
 
@@ -47,11 +49,13 @@ batch_db.init(core.CONFIG["results_dir"] / "batches.db")
 for _recovered in batch_db.recover_interrupted():   # a restart leaves nothing running
     print(f"batch {_recovered}: was interrupted by a restart, closed off from what finished")
 
+SERVER_STARTED = time.strftime("%Y-%m-%d %H:%M:%S")
+
 api = FastAPI(
     title="Image Restorer API",
     version="1.0.0",
     description=(
-        "Restores document images: warping, shadows, blur, low resolution, appearance and tears. "
+        "Restores document images: warping, skew, shadows, blur, low resolution, appearance and tears. "
         "Each step has its own detector, and a correction only runs when its detector finds the "
         "problem.\n\n"
         "**One image:** `POST /api/v1/images` returns the restored file in the same response.\n\n"
@@ -155,6 +159,21 @@ class BatchSummary(BaseModel):
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
+CHECKS_HELP = ("Which corrections to run, comma separated, out of "
+               "dewrap, deskew, shadow, blur, upscale, appearance, inpaint. "
+               "Leave it empty to run them all; a check left out is not performed.")
+
+
+def parse_checks(raw: str | None) -> set[str]:
+    """'shadow, blur' -> {'shadow', 'blur'}; empty means every check, as the page does by default."""
+    wanted = {c.strip().lower() for c in (raw or "").replace(";", ",").split(",") if c.strip()}
+    unknown = wanted - core.ALL_CHECKS
+    if unknown:
+        raise HTTPException(422, f"unknown check(s) {sorted(unknown)}; "
+                                 f"choose from {sorted(core.ALL_CHECKS)}")
+    return wanted or set(core.ALL_CHECKS)
+
+
 def ascii_header(value: str, limit: int = 800) -> str:
     """HTTP headers must be plain ASCII; the step texts contain - and x."""
     value = value.replace("\u2014", "-").replace("\u2013", "-").replace("\u00d7", "x")
@@ -169,6 +188,41 @@ def job_or_404(batch_id: str):
     return job
 
 
+@api.get("/api/v1/info", tags=["single image"], summary="What this server has loaded")
+def server_info():
+    """The models, the device and the code timestamp of the **running** server.
+
+    Useful after changing anything: if `code_loaded` is older than your edit, the server is still
+    running the previous version and needs restarting.
+    """
+    import datetime as _dt
+
+    def stamp(path):
+        path = Path(path)
+        return (_dt.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                if path.exists() else "missing")
+
+    return {
+        "device": str(core.DEVICE),
+        "gpu": torch.cuda.get_device_name(0) if core.DEVICE.type == "cuda" else None,
+        "models": {
+            "dewarp": f"{Path(core.CONFIG['doctr_seg_path']).name} + "
+                      f"{Path(core.CONFIG['doctr_geotr_path']).name} (DocTr)"
+                      if "doctr_seg_path" in core.CONFIG
+                      else f"{Path(core.CONFIG['uvdoc_model_path']).name} (UVDoc)",
+            "shadow": Path(core.CONFIG["shadow_model_path"]).name,
+            "blur": Path(core.CONFIG["blur_model_path"]).name,
+            "restoration": Path(core.CONFIG["docres_model_path"]).name,
+            "upscale": f"{Path(core.CONFIG['esrgan_model_path']).name} (x{core.ESRGAN_SCALE})",
+            "inpaint": Path(core.CONFIG["lama_model_path"]).name,
+        },
+        "thresholds": {k: core.CONFIG[k] for k in
+                       ("dewarp_threshold", "deskew_threshold", "shadow_threshold", "blur_threshold", "upscale_below_px")},
+        "code_loaded": {"app.py": stamp(core.__file__), "api.py": stamp(__file__)},
+        "started": SERVER_STARTED,
+    }
+
+
 # ─── 1. one image ────────────────────────────────────────────────────────────
 
 @api.post(
@@ -181,17 +235,20 @@ def job_or_404(batch_id: str):
 )
 def process_image(
     image: Annotated[UploadFile, File(description="One image (.jpg .jpeg .png .bmp .tif .tiff .webp .j2k .jp2)")],
+    checks: Annotated[str, Form(description=CHECKS_HELP, examples=["dewrap,shadow,blur"])] = "",
 ):
     """Processes ONE image and returns the restored file in the same response.
 
-    Every check runs - warping, shadow, blur, resolution and damage - and each model decides for
-    itself whether its correction is needed, exactly as the web page does.
+    Every check runs by default - warping, skew, shadow, blur, resolution, enhancement and damage - and
+    each model decides for itself whether its correction is needed, exactly as the web page does.
+    Send `checks` to run only some of them; a check left out is neither detected nor corrected.
 
     The call blocks until the image is finished (about 5-75 s, depending on the image and the
     corrections needed), so allow a long client timeout; if a batch is running it waits its turn
     for the GPU. What was done comes back in the headers **X-Corrections**, **X-Steps-Detail**,
     **X-Resolution** and **X-Seconds**.
     """
+    wanted = parse_checks(checks)
     ext = Path(image.filename or "").suffix.lower()
     if ext not in core.VALID_EXTS:
         raise HTTPException(415, f"unsupported file type '{ext}'; use one of {sorted(core.VALID_EXTS)}")
@@ -205,7 +262,7 @@ def process_image(
     t0 = time.time()
     try:
         w = core.run_workflow(
-            img, data, set(core.ALL_CHECKS),   # every detector runs; the models decide what to correct
+            img, data, wanted,                 # the chosen detectors run; the models decide what to correct
             lambda stage, state, text="", hit=False:
             state != "running" and detail.append(f"{stage}={state}" + (f":{text}" if text else "")))
         out = core.encode_image(w["image"], ext)
@@ -285,13 +342,15 @@ def create_batch(
                                       "Each file keeps its path inside the folder, e.g. "
                                       "old_records/page2.jpg")],
     batch_name: Annotated[str | None, Form(description="A name for this batch, e.g. Grave Images")] = None,
+    checks: Annotated[str, Form(description=CHECKS_HELP, examples=["dewrap,shadow,blur"])] = "",
 ):
     """Takes the images of one folder, creates a batch and **starts processing in the background**.
 
     Returns straight away with the `batch_id`; nothing is processed inside this request. Every image
     gets a record with status `PENDING`, and the worker moves each one to `PROCESSING` and then
     `COMPLETED` or `FAILED`. Sub-folders are kept, so `old_records/page2.jpg` stays where it was and
-    files with the same name in different folders do not clash. Unsupported files (.txt, .pdf,
+    files with the same name in different folders do not clash. Every check runs unless `checks`
+    names the ones wanted. Unsupported files (.txt, .pdf,
     .docx, .json, ...) are ignored and never fail the batch.
 
     Follow the batch with `GET /api/v1/batches/{batch_id}` and fetch the result from
@@ -301,6 +360,7 @@ def create_batch(
     picker there. Select the folder's images, or use the app's own page, which has a real
     "Choose a folder" button.
     """
+    wanted = parse_checks(checks)
     uploads = [f for f in (files or []) if f.filename]
     if not uploads:
         raise HTTPException(400, "no images given: choose a folder in the frontend (field 'files')")
@@ -332,7 +392,7 @@ def create_batch(
     batch_db.create_batch(batch_id, batch_name or source or batch_id, saved)
 
     # hand the images to the worker that already exists in app.py, then follow it in the database
-    job = {"id": batch_id, "checks": set(core.ALL_CHECKS), "state": "queued",
+    job = {"id": batch_id, "checks": wanted, "state": "queued",
            "items": [core.new_item(name) for name, _ in saved], "results": []}
     with core.JOBS_LOCK:
         core.JOBS[batch_id] = job
