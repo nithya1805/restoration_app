@@ -66,6 +66,6 @@ blur.py
 check_deskew.py
 fold_test.py
 config/
-models/*.py
+deblurgan/
 inference_package/
 templates/index_flask_backup.html
