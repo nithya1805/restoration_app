@@ -16,12 +16,6 @@ venv/
 env/
 ENV/
 
-# ML model weights (large binary files — download separately)
-models/*.pt
-models/*.pth
-models/*.pkl
-models/*.onnx
-
 # Uploaded images & processed results (user data, not source code)
 input/
 results/
@@ -40,12 +34,17 @@ Desktop.ini
 # Logs
 *.log
 
-# All model weights, wherever they are (models/, weights/, inference_package/) — download separately
+# Model weights: only the app's models/ folder is committed (through Git LFS, see .gitattributes);
+# weights anywhere else (weights/, inference_package/) stay local
 *.pt
 *.pth
 *.pkl
 *.onnx
 *.h5
+!models/*.pt
+!models/*.pth
+!models/*.pkl
+!models/*.onnx
 inference_package.zip
 
 # Test images and outputs (local data, not source code)

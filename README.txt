@@ -23,21 +23,29 @@ REQUIREMENTS
   * Optional but much faster: an NVIDIA GPU (see the GPU section below)
 
 SETTING UP A FRESH CLONE (from GitHub)
-  The repository holds the source code only. The model weights (~700 MB) and
-  two external projects are NOT in it and must be added by hand.
+  The repository holds the source code and the model weights (models\, ~680 MB,
+  stored with Git LFS). The code of the external projects is NOT in it.
+
+  Clone with Git LFS installed (https://git-lfs.com), so the weights are downloaded
+  and not just small pointer files:
+       git lfs install
+       git clone https://github.com/nithya1805/restoration_app.git
+  (already cloned without LFS? run "git lfs pull" in the folder)
 
   1. Python packages:
        python -m venv .venv
        .venv\Scripts\pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu126
      (no NVIDIA GPU? use .../whl/cpu and the +cpu versions in requirements.txt)
 
-  2. Model weights -> put them in models\ :
+  2. Model weights - already in models\ after the clone:
        shadow_model.onnx       trained for this project (shadow detection)
        blur_model.pt           trained for this project (blur detection)
        docres.pkl              DocRes weights: https://github.com/ZZZHANG-jx/DocRes
-       RealESRGAN_x4plus.pth   https://github.com/xinntao/Real-ESRGAN/releases
-       RealESRGAN_x2plus.pth   (optional: 2x instead of 4x)
+       RealESRGAN_x2plus.pth   https://github.com/xinntao/Real-ESRGAN/releases (2x, used)
+       RealESRGAN_x4plus.pth   (4x alternative)
        big-lama.pt             https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt
+       best_model.pkl          UVDoc weights (warp detection)
+       seg.pth, geotr.pth      DocTr weights (dewarping): https://github.com/fh2019ustc/DocTr
 
   3. Two external projects, for their code (and the UVDoc weights):
        DocRes  -> C:\DocRes   https://github.com/ZZZHANG-jx/DocRes
