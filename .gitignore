@@ -60,3 +60,13 @@ test/
 test_out/
 output/
 output.png
+
+# Experiments, test scripts and side projects — kept locally, not part of the app
+TEST.PY
+blur.py
+check_deskew.py
+fold_test.py
+config/
+models/*.py
+inference_package/
+templates/index_flask_backup.html
